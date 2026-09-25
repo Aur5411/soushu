@@ -8,6 +8,7 @@ local.properties
 
 # ===== 构建产物 / 缓存 =====
 .gradle/
+.gradle-home/
 build/
 app/build/
 captures/

@@ -70,8 +70,6 @@ class MainActivity : AppCompatActivity() {
     // 预先在主线程缓存 UA 与最近的内容页地址（作下载 Referer），供后台拦截线程读取
     @Volatile private var cachedUserAgent: String = ""
     @Volatile private var lastContentPageUrl: String? = null
-    // 当前页面「书名」（CSS 提取 #thread_subject），供下载乱码时重命名兜底
-    @Volatile private var cachedBookName: String? = null
     private val popupWindows = mutableListOf<WebView>()
 
     // —— 启动入口智能重试 ——
@@ -247,7 +245,6 @@ class MainActivity : AppCompatActivity() {
                 }
                 updateTitle()
                 recordHistory(view, url)
-                extractBookName()
                 DebugLog.log("PAGE", "加载完成: $url | title=${view?.title}")
             }
 
@@ -366,11 +363,11 @@ class MainActivity : AppCompatActivity() {
                         DebugLog.log("INTERCEPT", "重复请求，跳过: $url")
                         null
                     } else {
-                        val bn = currentBookName()
-                        val name = DownloadHelper.resolveWithBookName(p.finalUrl, p.disposition, bn)
-                        val savedName = DownloadHelper.saveFromFile(this@MainActivity, p.file, name)
+                        val hint = nameHintForUrl(p.finalUrl)
+                        val name = DownloadHelper.resolveFileName(p.finalUrl, p.disposition, hint)
+                        val savedName = DownloadHelper.saveFromFile(this@MainActivity, p.file, name, !hint.isNullOrBlank())
                         p.file.delete()
-                        DebugLog.log("INTERCEPT", "已保存: $savedName (${p.size}B) | 书名=$bn")
+                        DebugLog.log("INTERCEPT", "已保存: $savedName (${p.size}B)")
                         runOnUiThread {
                             Toast.makeText(
                                 this@MainActivity,
@@ -864,79 +861,6 @@ class MainActivity : AppCompatActivity() {
         HistoryStore.add(this, url, title)
     }
 
-    /**
-     * 用 CSS 定位提取当前页面「书名」标签，缓存起来供下载乱码时重命名兜底。
-     * Discuz 帖子页书名在 <span id="thread_subject">（外层 <h1 class="ts">），
-     * 兜底依次尝试 h1；再退而求其次从 document.title 去掉「站点名 / Powered by Discuz」。
-     */
-    private fun extractBookName() {
-        // 只有真正的「帖子页」（含 #thread_subject / h1.ts）才提取并覆盖书名缓存；
-        // 中转页/提示页/列表页没有这些元素，绝不能污染已缓存的书名。
-        // 同步兜底：先解析 webView.title，但仅当标题是有效书名时才考虑（过滤提示信息等系统页）。
-        val title = webView.title?.takeIf { it.isNotBlank() }
-        if (title != null) {
-            parseBookNameFromTitle(title)?.let { parsed ->
-                // 标题兜底只在「还没有缓存书名」或「当前是有效书名且不是系统提示页」时才写入，
-                // 避免中转页的「提示信息」标题覆盖掉帖子页已提取的正确书名。
-                if (cachedBookName.isNullOrBlank()) {
-                    cachedBookName = parsed
-                    DebugLog.log("BOOK", "同步书名(标题解析,缓存为空): $parsed")
-                } else {
-                    DebugLog.log("BOOK", "已有书名缓存，跳过标题兜底: $parsed (当前=$cachedBookName)")
-                }
-            }
-        }
-        val js = """
-(function(){
-  try{
-    var el = document.querySelector('#thread_subject') || document.querySelector('h1.ts');
-    if(el){
-      var t = (el.textContent || el.innerText || '').replace(/\s+/g,' ').trim();
-      if(t && t.length >= 2) return t;
-    }
-    return '';
-  }catch(e){ return ''; }
-})();
-""".trimIndent()
-        webView.evaluateJavascript(js) { res ->
-            val clean = res?.trim()?.removePrefix("\"")?.removeSuffix("\"") ?: ""
-            if (clean.isNotBlank() && clean.length <= 200) {
-                cachedBookName = clean
-                DebugLog.log("BOOK", "CSS提取到书名(帖子页): $clean")
-            } else {
-                // 非帖子页（无 #thread_subject/h1.ts），不更新缓存
-                DebugLog.log("BOOK", "非帖子页，未提取书名 @ ${webView.url}")
-            }
-        }
-    }
-
-    /** 从 document.title 解析书名：取第一个不含站点名/后缀/系统提示词的片段 */
-    private fun parseBookNameFromTitle(title: String): String? {
-        val parts = title.split(Regex("\\s*-\\s*"))
-        for (p in parts) {
-            val t = p.trim()
-            if (t.isNotEmpty() && !Regex("(?i)Powered by Discuz|搜书吧|Discuz|论坛|书吧|网站|提示信息|提示|错误|系统|登录|注册").containsMatchIn(t)) {
-                return t
-            }
-        }
-        return null
-    }
-
-    /** 判断书名是否可用（过滤"提示信息"等系统提示页标题/空值/纯下划线垃圾） */
-    private fun isUsableBookName(name: String): Boolean {
-        if (name.isBlank()) return false
-        val t = name.trim()
-        if (t.length < 2) return false
-        // 系统提示页/无效标题：不含任何中文字符，或匹配系统提示词
-        if (!t.any { it in '\u4e00'..'\u9fff' }) return false
-        if (Regex("(?i)^(提示信息|提示|错误提示|系统提示|登录|注册|下载|附件|Powered by Discuz|搜书吧|论坛|书吧)$").containsMatchIn(t)) return false
-        return true
-    }
-
-    /** 统一获取当前有效书名（过滤历史遗留的"提示信息"等无效缓存），供下载三条通道兜底用 */
-    private fun currentBookName(): String? =
-        cachedBookName?.takeIf { isUsableBookName(it) }
-
     /** 判定“打不开”类网络错误码（DNS/连接/超时/IO 等），忽略 HTTP 状态与文件类错误 */
     private fun isEntryNetworkError(code: Int): Boolean {
         return code == android.webkit.WebViewClient.ERROR_UNKNOWN ||        // -1
@@ -1002,12 +926,23 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun fetchBegin(cd: String?, mime: String?) {
             val u = pendingFetchUrl ?: return
-            val bn = currentBookName()
+            fetchNameHint = nameHintForUrl(u)
             fetchFileName = try {
-                DownloadHelper.resolveWithBookName(u, if (cd.isNullOrBlank()) null else cd, bn)
+                DownloadHelper.resolveFileName(u, if (cd.isNullOrBlank()) null else cd, fetchNameHint)
             } catch (e: Exception) { "download_" + System.currentTimeMillis() }
             fetchB64.setLength(0)
-            DebugLog.log("FETCH", "浏览器通道命名: $fetchFileName | 书名=$bn | cd=$cd | mime=$mime")
+            DebugLog.log("FETCH", "浏览器通道命名: $fetchFileName | cd=$cd | mime=$mime | hint=$fetchNameHint")
+        }
+
+        /**
+         * 附件真实文件名上报（注入脚本从帖子 DOM 的 `<span class="attachname">` 读出）。
+         * 点下载时 contentDisposition 为 null、URL 只是脚本页，原生侧只能靠这里拿到帖子里的文件名。
+         */
+        @JavascriptInterface
+        fun attachName(auditId: String?, name: String?) {
+            if (auditId.isNullOrBlank() || name.isNullOrBlank()) return
+            attachNames[auditId.trim()] = name.trim()
+            DebugLog.log("ATT", "附件名上报: $auditId -> $name")
         }
 
         @JavascriptInterface
@@ -1028,7 +963,7 @@ class MainActivity : AppCompatActivity() {
                     return@runOnUiThread
                 }
                 try {
-                    val savedName = DownloadHelper.save(this@MainActivity, data, fetchFileName)
+                    val savedName = DownloadHelper.save(this@MainActivity, data, fetchFileName, !fetchNameHint.isNullOrBlank())
                     fetchFileName = savedName
                     DebugLog.log("FETCH", "保存成功: $savedName (${data.size}B)")
                     Toast.makeText(
@@ -1059,7 +994,45 @@ class MainActivity : AppCompatActivity() {
     // 浏览器通道状态
     private var pendingFetchUrl: String? = null
     private var fetchFileName: String = ""
+    private var fetchNameHint: String? = null
     private val fetchB64 = StringBuilder()
+
+    /**
+     * 附件真实文件名映射：附件 id → 帖子内显示的文件名（由注入脚本从 DOM 上报）。
+     * Discuz 帖子页的文件名在 `<span class="attachname">` 里，而下载链接文字固定是「下载」，
+     * 下载时响应头又没有 filename，所以必须靠这张表才能命名为帖子里的文件名。
+     * 只在内存保留、天然随页面跳转覆盖，无需清理策略。
+     */
+    private val attachNames = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /**
+     * 从附件下载 URL 求「附件 id」（与注入脚本 auditOf 同一套规则）：
+     * `?aid=<urlencode(base64)>` 解码后形如 `4563314|61f7b6c2|...`，取 `|` 前第一段；
+     * aid 本身是纯数字时直接用。免银币伪造签名 `aid|1|1|1|tid` 同样取第一段。
+     */
+    private fun auditIdOf(url: String?): String? {
+        if (url.isNullOrBlank()) return null
+        val m = Regex("[?&]aid=([^&#]+)").find(url) ?: return null
+        val raw = try {
+            java.net.URLDecoder.decode(m.groupValues[1], "UTF-8")
+        } catch (e: Exception) { m.groupValues[1] }
+        if (raw.all { it.isDigit() } && raw.isNotEmpty()) return raw
+        return try {
+            // base64 里可能含 '+'，URLDecoder 会把它解成空格，需还原
+            val b64 = raw.replace(' ', '+')
+            val decoded = String(
+                android.util.Base64.decode(b64, android.util.Base64.DEFAULT),
+                Charsets.ISO_8859_1
+            )
+            decoded.substringBefore('|').filter { it.isLetterOrDigit() }.ifBlank { null }
+        } catch (e: Exception) { null }
+    }
+
+    /** 查附件 URL 对应的「帖子内文件名」，查不到返回 null */
+    private fun nameHintForUrl(url: String?): String? {
+        val id = auditIdOf(url) ?: return null
+        return attachNames[id]
+    }
 
     /**
      * 浏览器通道下载：原生请求被服务器返回网页拦截时，改用页面内 fetch 获取文件
@@ -1242,24 +1215,20 @@ class MainActivity : AppCompatActivity() {
             return
         }
         // v1.8.x：无确认弹窗，检测到文件立即自动下载（原生通道，失败自动切浏览器通道）
-        // 当前书名：优先用 CSS 提取的 cachedBookName（仅当它是有效书名），否则同步从页面标题解析
-        val cached = cachedBookName?.takeIf { isUsableBookName(it) }
-        val bookName = cached
-            ?: webView.title?.takeIf { it.isNotBlank() }?.let { parseBookNameFromTitle(it) }?.takeIf { isUsableBookName(it) }
+        // 文件名优先级：帖子内文件名（DOM 上报）→ 响应头 Content-Disposition → URL 兜底
+        val hint = nameHintForUrl(httpUrl)
         val fileName = try {
-            DownloadHelper.resolveWithBookName(httpUrl, contentDisposition, bookName)
+            DownloadHelper.resolveFileName(httpUrl, contentDisposition, hint)
         } catch (e: Exception) { "download_" + System.currentTimeMillis() }
-        DebugLog.log("DL", "开始原生下载: $httpUrl | mime=$mimeType | cd=$contentDisposition | 书名=$bookName | 命名=$fileName")
+        DebugLog.log("DL", "开始原生下载: $httpUrl | mime=$mimeType | cd=$contentDisposition | hint=$hint | 命名=$fileName")
         val nameDisplay = if (fileName.startsWith("download_")) "自动识别文件名" else fileName
         Toast.makeText(this, "开始下载：$nameDisplay", Toast.LENGTH_SHORT).show()
         DownloadHelper.start(
             this, webView.settings.userAgentString, httpUrl,
             contentDisposition, webView.url,
-            // 书名（CSS 提取 #thread_subject）优先，其次页面标题解析，作为乱码响应头的兜底名称
-            fallbackName = bookName
-        ) { origUrl ->
-            runBrowserFetch(origUrl)
-        }
+            { origUrl -> runBrowserFetch(origUrl) },
+            hint
+        )
     }
 
     /** UA 由设置页开关决定，默认电脑版 */

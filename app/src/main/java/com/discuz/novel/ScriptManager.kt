@@ -31,6 +31,12 @@ object ScriptManager {
         // 附件「重新下载」自动重试：免银币脚本伪造签名下载时，Discuz 会返回
         // 「原附件链接已失效」提示页，页内有「点击这里重新下载」链接；自动点击之完成下载。
         sb.append(retryAttachmentJs())
+        sb.append('\n')
+        // 附件真实文件名上报：Discuz 帖子页的 <span class="attachname"> 里才有真实文件名，
+        // 下载链接文字固定是「下载」。点下载时 contentDisposition 为 null，URL 又只是
+        // forum.php?mod=attachment&aid=...，原生侧解析不出书名 —— 必须由本脚本先把
+        // 文件名按 aid 上报给原生，下载时用它命名。
+        sb.append(attachNameJs())
         val custom = Prefs.getCustomJs(ctx).trim()
         if (custom.isNotEmpty()) {
             if (sb.isNotEmpty()) sb.append('\n')
@@ -495,6 +501,130 @@ object ScriptManager {
       }
     }
   }catch(e){}
+})();
+""".trimIndent()
+    }
+
+    /**
+     * 附件真实文件名上报（v2.4.0）。
+     *
+     * 背景：搜书吧帖子页的附件块结构为
+     *   <dl class="tattl"><dd>
+     *     <p class="mbn"><span class="attachname">1.jpg</span><span class="y">免费</span></p>
+     *     <p class="buttons"><a href="forum.php?mod=attachment&aid=<base64>&nothumb=yes"
+     *         id="aid4563314" class="xw1 btn_download">下载</a></p>
+     *   </dd></dl>
+     * —— 真实文件名在 `<span class="attachname">` 里，而下载链接的文字固定是「下载」。
+     *
+     * 点下载时 DownloadListener 给的 contentDisposition 为 null，URL 也只是
+     * `forum.php?mod=attachment&aid=...`（解析出来是脚本页名）。所以「帖子内的文件名」
+     * 原生侧根本拿不到，必须由本脚本先把 DOM 里的名字按附件 id 上报，下载时用它命名。
+     *
+     * 上报键用附件 id：`aid` 是 URL 编码的 base64，解码后形如
+     * `4563314|61f7b6c2|1790359004|1119960|1503027`，第一段就是附件 id。
+     * 该形态对「正常签名」与「免银币伪造签名(aid|1|1|1|tid)」都成立；aid 本身就是纯数字时直接用它。
+     */
+    private fun attachNameJs(): String {
+        return """
+(function(){
+  if(window.__dzAttNameInit) return; window.__dzAttNameInit=1;
+  var reported={};
+
+  function norm(s){ return String(s==null?'':s).replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim(); }
+
+  // 通用占位文字（不是文件名）
+  function isGeneric(t){
+    return !t || /^(下载|附件|立即下载|点击下载|点击这里下载|重新下载|免费|download|attach|attachment)$/i.test(t);
+  }
+
+  // 从 href 求 Discuz 附件 id
+  function auditOf(href){
+    try{
+      var m=/[?&]aid=([^&#]+)/.exec(String(href||''));
+      if(!m) return '';
+      // 先百分号解码，再把残留空格还原成 base64 的 '+'（Discuz 把 '+' 编码为 %2B，
+      // 不受影响；只在服务器漏编码时兜底），避免 '+' 被当成空格导致解码失败。
+      var raw=decodeURIComponent(m[1]).replace(/ /g,'+');
+      if(/^\d+$/.test(raw)) return raw;              // 直接数字形态
+      var txt='';
+      try{ txt=atob(raw); }catch(e){ return ''; }
+      var id=(txt.split('|')[0]||'').replace(/[^0-9A-Za-z]/g,'');
+      return id;
+    }catch(e){ return ''; }
+  }
+
+  // 从链接所在容器找真实文件名
+  function nameOf(a){
+    try{
+      var box=null;
+      try{
+        box = (a.closest && (a.closest('dl.tattl') || a.closest('.pattl') || a.closest('ignore_js_op'))) || null;
+      }catch(e){ box=null; }
+      if(!box){
+        // 模板差异兜底：逐级上溯找工作里含 .attachname 的容器
+        var n=a, hops=0;
+        while(n && n.nodeType===1 && hops++<6){
+          if(n.querySelector && n.querySelector('.attachname')){ box=n; break; }
+          n=n.parentElement;
+        }
+      }
+      if(box){
+        // 主路径：Discuz 标准模板的 <span class="attachname">真实文件名</span>
+        var sp=box.querySelector('.attachname');
+        var t=norm(sp? sp.textContent : '');
+        if(!isGeneric(t)) return t;
+        // 兜底：容器 dd / .mbn 内首个「像文件名」的文本（含扩展名）
+        var cands=box.querySelectorAll('dd,p,.mbn');
+        for(var i=0;i<cands.length;i++){
+          var x=norm(cands[i].textContent);
+          if(!isGeneric(x) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(x)) return x;
+        }
+      }
+      // 最后兜底：链接自身文字 / title（部分模板直接把文件名写成链接文字）
+      var at=norm(a.textContent);
+      if(!isGeneric(at)) return at;
+      var ti=norm(a.getAttribute && a.getAttribute('title'));
+      if(!isGeneric(ti)) return ti;
+      return '';
+    }catch(e){ return ''; }
+  }
+
+  function scan(){
+    try{
+      if(!window.DiscuzApp || !window.DiscuzApp.attachName) return;
+      var links=document.querySelectorAll('a[href*="mod=attachment"],a[href*="attachment.php"]');
+      for(var i=0;i<links.length;i++){
+        var a=links[i], href=a.getAttribute('href')||'';
+        if(/attachpay/i.test(href)) continue;         // 付费购买浮层，不是文件
+        var id=auditOf(href);
+        if(!id || reported[id]) continue;
+        var nm=nameOf(a);
+        if(!nm) continue;
+        reported[id]=nm;
+        try{ window.DiscuzApp.attachName(id, nm); }catch(e){}
+      }
+    }catch(e){}
+  }
+
+  function start(){
+    scan();
+    // 附件块可能由 AJAX/异步模板插入：监听只置脏位并合并处理，并限时拆除，
+    // 避免像旧代码那样「回调里扫全文档且永不停止」拖慢主线程。
+    var dirty=false, mo=null;
+    try{
+      mo=new MutationObserver(function(){ dirty=true; });
+      mo.observe(document.documentElement||document.body,{childList:true,subtree:true});
+    }catch(e){}
+    var iv=setInterval(function(){ if(dirty){ dirty=false; scan(); } },300);
+    setTimeout(function(){
+      try{ if(mo){ mo.disconnect(); mo=null; } }catch(e){}
+      try{ clearInterval(iv); }catch(e){}
+      scan();
+    },20000);
+  }
+
+  if(document.readyState==='complete') start();
+  else window.addEventListener('load', start);
 })();
 """.trimIndent()
     }

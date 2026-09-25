@@ -46,24 +46,29 @@ object DownloadHelper {
     fun start(
         ctx: Context, userAgent: String, url: String,
         contentDisposition: String?, referer: String?,
-        fallbackName: String? = null,
-        onHtmlFallback: ((String) -> Unit)? = null
+        onHtmlFallback: ((String) -> Unit)? = null,
+        nameHint: String? = null
     ) {
         val appCtx = ctx.applicationContext
         thread {
             try {
-                // 书名（帖子标题）优先：书名可靠且完整，直接作为文件名，不做响应头乱码检测
-                val presetName = if (!fallbackName.isNullOrBlank()) {
-                    fallbackName
-                } else if (!contentDisposition.isNullOrBlank()) {
-                    resolveFileName(url, contentDisposition)
-                } else {
-                    resolveFileName(url, null)
-                }
-                val finalName = download(appCtx, userAgent, url, presetName, referer, fallbackName, onHtmlFallback)
+                // 文件名优先级：帖子内文件名(nameHint) → 响应头 Content-Disposition → URL 末段兜底
+                val presetName = resolveFileName(url, contentDisposition, nameHint)
+                val finalName = download(appCtx, userAgent, url, presetName, referer, onHtmlFallback, nameHint)
                 if (finalName != null) {
                     mainHandler.post {
                         Toast.makeText(appCtx, "下载完成：$finalName\n保存于 Download/${Prefs.getDownloadDir(appCtx)}", Toast.LENGTH_LONG).show()
+                    }
+                } else {
+                    // 原生通道把活交给了浏览器通道（返回 null 且已回调 onHtmlFallback）。
+                    // 关键修复（v2.5.0）：这里以前完全静默——用户只看到「开始下载」就再无动静，
+                    // 既没有成功提示也没有失败提示，无法判断到底发生了什么。现在明确告知。
+                    mainHandler.post {
+                        Toast.makeText(
+                            appCtx,
+                            "正在改用浏览器通道下载…\n若随后仍无「下载完成」提示，说明服务器返回的是网页（通常是未登录或权限不足）",
+                            Toast.LENGTH_LONG
+                        ).show()
                     }
                 }
             } catch (e: Exception) {
@@ -76,11 +81,29 @@ object DownloadHelper {
 
     // ---------------- 文件名处理 ----------------
 
-    /** 从 Content-Disposition / URL 中解析文件名，并做乱码修复 + 去网站标记 */
-    fun resolveFileName(url: String, contentDisposition: String?): String {
+    /**
+     * 从 Content-Disposition / URL 中解析文件名，并做乱码修复 + 去网站标记。
+     *
+     * @param nameHint 帖子内附件显示的真实文件名（由注入脚本从 DOM 的
+     *        `<span class="attachname">` 读出、按附件 id 上报）。**这是最可靠的来源**：
+     *        点下载时 DownloadListener 传回的 contentDisposition 通常为 null，
+     *        URL 又只是 `forum.php?mod=attachment&aid=...`（解析出来是脚本页名），
+     *        只有帖子里的名字才是用户真正想要的文件名。
+     */
+    fun resolveFileName(url: String, contentDisposition: String?, nameHint: String? = null): String {
+        // 0. 最高优先级：帖子内显示的文件名（已经是可读中文，只需清理非法字符）
+        if (!nameHint.isNullOrBlank()) {
+            val cleaned = fixEncoding(nameHint).let { stripWebsite(it) }
+                .replace(Regex("[\\\\/:*?\"<>|\\uFFFD]"), "_")
+                .trim()
+            if (cleaned.isNotBlank() && !looksLikeScriptOrGenericPage(cleaned)) {
+                return cleaned
+            }
+        }
+
         var name: String? = null
 
-        // 1. Content-Disposition 中的 filename*=（RFC 5987 编码）
+        // 1. Content-Disposition 中的 filename*=（RFC 5987 编码，如 UTF-8''%E4%B9%A6.txt）
         if (!contentDisposition.isNullOrBlank()) {
             Regex("filename\\*\\s*=\\s*([^']*)''([^;]+)", RegexOption.IGNORE_CASE)
                 .find(contentDisposition)?.let {
@@ -88,43 +111,117 @@ object DownloadHelper {
                     name = decodeFilenameCandidates(raw).firstOrNull()
                 }
             // 2. Content-Disposition 中的普通 filename=
+            //    Discuz(PHP) 中文附件名常用 MIME encoded-word 包裹：filename="=?UTF-8?B?5Lmm5ZCN.txt?="
+            //    必须先还原 encoded-word，否则会被当成一串无意义字符（旧版就漏了这一步，是书名异常的主因）
             if (name.isNullOrBlank()) {
                 Regex("filename\\s*=\\s*\"?([^\";]+)\"?", RegexOption.IGNORE_CASE)
                     .find(contentDisposition)?.let {
-                        val raw = it.groupValues[1].trim()
+                        val raw = decodeMimeWord(it.groupValues[1].trim())
                         name = decodeFilenameCandidates(raw).firstOrNull()
                     }
             }
         }
 
-        // 3. URL 最后一段兜底
-        if (name.isNullOrBlank() || !name!!.contains('.')) {
+        // 3. URL 最后一段兜底：但 Discuz 附件链接形如 forum.php?mod=attachment&aid=xxx，
+        //    其最后一段是 forum.php —— 脚本页绝不是文件名，必须排除（旧版会把它当书名保存）
+        if (name.isNullOrBlank() || !name!!.contains('.') || looksLikeScriptOrGenericPage(name)) {
             val seg = Uri_parseLastSegment(url)
-            if (seg != null && seg.contains('.')) {
+            if (seg != null && seg.contains('.') && !looksLikeScriptOrGenericPage(seg)) {
                 val segName = try {
                     fixEncoding(URLDecoder.decode(seg, "UTF-8"))
                 } catch (e: Exception) { fixEncoding(seg) }
-                name = segName
+                if (!looksLikeScriptOrGenericPage(segName)) name = segName
             }
         }
 
-        // 4. 最终兜底名
-        if (name.isNullOrBlank()) {
+        // 4. 最终兜底名（响应头/URL 都拿不到可用名，或只是脚本页时）
+        if (name.isNullOrBlank() || looksLikeScriptOrGenericPage(name)) {
             name = "download_" + System.currentTimeMillis()
         }
 
         var result = fixEncoding(name!!)
         result = stripWebsite(result)
-        
+
         // 清理文件名非法字符与无效乱码
-        result = result.replace(Regex("[\\\\/:*?\"<>|\\uFFFD]"), "_") 
-        
+        result = result.replace(Regex("[\\\\/:*?\"<>|\\uFFFD]"), "_")
+
         return result
     }
 
     private fun Uri_parseLastSegment(url: String): String? = try {
         android.net.Uri.parse(url).lastPathSegment
     } catch (e: Exception) { null }
+
+    /** 脚本/网页类扩展名：Discuz 附件链接的最后一段常是这些，绝不能当文件名 */
+    private val SCRIPT_EXTENSIONS = setOf(
+        ".php", ".php3", ".php4", ".php5", ".phtml", ".phps", ".asp", ".aspx", ".ashx",
+        ".jsp", ".jspx", ".do", ".action", ".cgi", ".pl", ".shtml", ".html", ".htm", ".xhtml"
+    )
+
+    /** Discuz 附件下载端点的通用无意义主体名 */
+    private val GENERIC_FILE_BASES = setOf(
+        "attachment", "forum", "file", "index", "member", "home", "misc",
+        "viewthread", "plugin", "download", "ajax", "api", "search"
+    )
+
+    /**
+     * 判断解析出来的名字是不是「脚本页/通用端点名」而非真实文件名。
+     * - 无扩展名 → 视为正常名（有些附件确实没有扩展名），不判为脚本页；
+     * - 扩展名属脚本/网页类 → 是脚本页；
+     * - 主体名是 Discuz 通用端点名（forum/attachment/...）→ 是脚本页。
+     */
+    private fun looksLikeScriptOrGenericPage(name: String?): Boolean {
+        if (name.isNullOrBlank()) return true
+        val i = name.lastIndexOf('.')
+        if (i <= 0) return false
+        val ext = name.substring(i).lowercase()
+        if (ext in SCRIPT_EXTENSIONS) return true
+        val base = name.substring(0, i).lowercase()
+        return base in GENERIC_FILE_BASES
+    }
+
+    /**
+     * 还原 MIME encoded-word：`=?UTF-8?B?<base64>?=` 或 `=?GBK?Q?<quoted>?=`。
+     * Discuz(PHP) 在 Content-Disposition 里给中文文件名时会用这种格式。
+     * 解析失败原样返回，不影响其它分支。
+     */
+    private fun decodeMimeWord(value: String): String {
+        val t = value.trim().trim('"')
+        val m = Regex("=\\?([^?]+)\\?([BbQq])\\?([^?]*)\\?=").find(t) ?: return t
+        return try {
+            val cs = charsetOf(m.groupValues[1])
+            val mode = m.groupValues[2].uppercase()
+            val payload = m.groupValues[3]
+            val bytes = if (mode == "B") {
+                android.util.Base64.decode(payload, android.util.Base64.DEFAULT)
+            } else {
+                decodeQuotedPrintable(payload)
+            }
+            String(bytes, cs)
+        } catch (e: Exception) { t }
+    }
+
+    private fun charsetOf(name: String): java.nio.charset.Charset = try {
+        java.nio.charset.Charset.forName(name.trim())
+    } catch (e: Exception) { Charsets.UTF_8 }
+
+    /** Q 编码：`_` 表示空格，`=XX` 是十六进制字节，其余按 latin-1 单字节 */
+    private fun decodeQuotedPrintable(s: String): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        var i = 0
+        while (i < s.length) {
+            val c = s[i]
+            when {
+                c == '_' -> { out.write(' '.code); i++ }
+                c == '=' && i + 2 < s.length -> {
+                    val hex = s.substring(i + 1, i + 3)
+                    out.write(hex.toInt(16)); i += 3
+                }
+                else -> { out.write(c.toString().toByteArray(Charsets.ISO_8859_1)); i++ }
+            }
+        }
+        return out.toByteArray()
+    }
 
     /**
      * 乱码修复：文件名可能经历 URL 编码、ISO-8859-1 误解码或 GBK/UTF-8 混用，
@@ -427,14 +524,14 @@ object DownloadHelper {
      * 兼容旧调用方：小字节数组先落到缓存文件，再复用统一的流式保存路径。
      * 大文件下载路径不应调用此方法，应直接调用 saveFromFile。
      */
-    fun save(ctx: Context, data: ByteArray, fileName: String): String {
+    fun save(ctx: Context, data: ByteArray, fileName: String, preserveName: Boolean = false): String {
         if (data.size.toLong() > MAX_DOWNLOAD_BYTES) {
             throw IOException("下载文件超过 ${MAX_DOWNLOAD_BYTES / (1024L * 1024L)} MB 限制")
         }
         val temp = File.createTempFile("download_", ".part", ctx.cacheDir)
         return try {
             FileOutputStream(temp).use { it.write(data) }
-            saveFromFile(ctx, temp, fileName)
+            saveFromFile(ctx, temp, fileName, preserveName)
         } finally {
             temp.delete()
         }
@@ -467,8 +564,11 @@ object DownloadHelper {
 
     /**
      * 从缓存文件流式保存到 Download 目录，整个过程只保留固定大小的复制缓冲区。
+     *
+     * @param preserveName true = 该名字来自帖子内 `attachname`，**原样保留**，
+     *        不做 cleanName 剥后缀、不做多编码猜测（用户要的就是帖子里的文件名）。
      */
-    fun saveFromFile(ctx: Context, source: File, fileName: String): String {
+    fun saveFromFile(ctx: Context, source: File, fileName: String, preserveName: Boolean = false): String {
         if (!source.isFile || !source.canRead()) throw IOException("下载临时文件不可读")
         val size = source.length()
         if (size <= 0L) throw IOException("下载文件为空")
@@ -477,7 +577,7 @@ object DownloadHelper {
         }
         // 用文件真实内容（魔数）识别类型，据此补/校正扩展名与 MIME，而非只靠文件名猜
         val fileType = detectFileType(source)
-        var finalName = normalizeSavedFileName(fileName, fileType)
+        var finalName = normalizeSavedFileName(fileName, fileType, preserveName)
         if (Build.VERSION.SDK_INT >= 29) {
             finalName = ensureUniqueNameMediaStore(ctx, finalName)
         }
@@ -494,8 +594,8 @@ object DownloadHelper {
     private fun download(
         ctx: Context, userAgent: String, url: String,
         presetName: String, referer: String?,
-        bookName: String?,
-        onHtmlFallback: ((String) -> Unit)?
+        onHtmlFallback: ((String) -> Unit)?,
+        nameHint: String? = null
     ): String? {
         var currentUrl = url
         var currentReferer = referer ?: url
@@ -539,6 +639,11 @@ object DownloadHelper {
                     buf.copyOf(n)
                 }
                 conn.disconnect()
+                // 诊断：把服务器返回的网页「标题 + 正文摘录」记入日志。
+                // 区分「未登录/权限不足」与「下载中转页」的关键证据就在这里（原本完全看不到）。
+                val title = findTitleInHtml(bodyBytes)
+                val excerpt = htmlExcerpt(bodyBytes)
+                DebugLog.log("DL", "返回网页而非文件 | HTTP=$code | len=${bodyBytes.size} | title=$title | body=${excerpt}")
                 val next = findRedirectInHtml(bodyBytes, currentUrl)
                 if (next != null && htmlHops < 3) {
                     htmlHops++
@@ -546,20 +651,30 @@ object DownloadHelper {
                     currentUrl = next
                     continue
                 }
-                // 穿透失败：交给浏览器通道（WebView 页面内 fetch，网络栈与真实浏览器一致）
+                // 穿透失败：交给浏览器通道（WebView 页面内 fetch，网络栈与真实浏览器一致）。
+                // 把服务器页面的原话告诉用户 —— 这是判断「未登录 / 权限不足 / 附件失效」的唯一线索，
+                // 以前这条分支完全静默，用户只看到「开始下载」后再无动静，无从判断原因。
                 if (onHtmlFallback != null) {
                     val cb = onHtmlFallback
+                    val note = title ?: excerpt.ifBlank { "未知提示" }
+                    mainHandler.post {
+                        Toast.makeText(
+                            ctx,
+                            "下载受阻：服务器返回的是网页\n「${note.take(60)}」\n正在改用浏览器通道…若再无「下载完成」提示，就是未登录或权限不足",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
                     mainHandler.post { cb(url) }
                     return null
                 }
                 throw IOException("返回的是网页而非文件（$currentUrl）\n请确认已在论坛登录，且自定义脚本已生效")
             }
 
-            // 书名优先：书名非空时直接用书名（已在 presetName 里），不再解析响应头 filename 做乱码检测。
-            // 仅当没有书名时，才解析响应头 filename 并用 isGarbledName 过滤乱码。
-            if (respCd != null && bookName.isNullOrBlank()) {
+            // 文件名优先用「帖子内显示的文件名」(nameHint)；没有才用响应头 filename 刷新，
+            // URL 兜底已在 presetName 里。（响应头乱码由 resolveFileName 内的 fixEncoding 处理）
+            if (respCd != null) {
                 try {
-                    val re = resolveFileName(currentUrl, respCd)
+                    val re = resolveFileName(currentUrl, respCd, nameHint)
                     if (isGarbledName(re)) {
                         name = if (!isGarbledName(name)) name else "download_" + System.currentTimeMillis()
                         DebugLog.log("DL", "文件名无效，用时间戳兜底: $name (原解析='$re')")
@@ -570,17 +685,15 @@ object DownloadHelper {
                 } catch (e: Exception) { DebugLog.log("DL", "文件名解析异常: ${e.message}") }
             }
 
-            // 最终确认：书名非空则一律用书名作为文件名（帖子标题最可靠）
-            if (!bookName.isNullOrBlank()) {
-                name = bookName
-                DebugLog.log("DL", "使用书名作为文件名: $name")
-            }
-
             // 下载内容先限额读入临时文件，避免大 TXT 形成整文件内存副本。
             val temp = File.createTempFile("download_", ".part", ctx.cacheDir)
+            // 名字来自帖子内 attachname 时原样保留（不剥后缀、不做编码猜测）。
+            // 只以 nameHint 是否存在为准：响应头若把 name 改成了别的（含 (1) 后缀等），
+            // 也不能因此丢掉「原样保留」语义 —— 用户要的就是帖子里的文件名。
+            val keepAsIs = !nameHint.isNullOrBlank()
             val finalName = try {
                 conn.inputStream.use { input -> copyLimitedToFile(input, temp, MAX_DOWNLOAD_BYTES) }
-                saveFromFile(ctx, temp, name)
+                saveFromFile(ctx, temp, name, keepAsIs)
             } finally {
                 temp.delete()
             }
@@ -680,12 +793,6 @@ object DownloadHelper {
     }
 
     /** 解析文件名：书名（帖子标题）非空时直接用它，否则解析响应头/URL */
-    fun resolveWithBookName(url: String, contentDisposition: String?, bookName: String?): String {
-        // 书名优先：帖子标题可靠且完整，直接作为文件名，不再做响应头乱码检测
-        if (!bookName.isNullOrBlank()) return bookName
-        return resolveFileName(url, contentDisposition)
-    }
-
     private fun isZipData(data: ByteArray): Boolean {
         return data.size >= 4 &&
             data[0] == 0x50.toByte() &&
@@ -769,7 +876,26 @@ object DownloadHelper {
         return UNKNOWN_FILE_TYPE
     }
 
-    private fun normalizeSavedFileName(fileName: String, fileType: FileType): String {
+    private fun normalizeSavedFileName(fileName: String, fileType: FileType, preserveName: Boolean = false): String {
+        // preserveName：名字来自帖子内 attachname，原样保留 —— 不做多编码猜测（避免把正常中文
+        // 「解码」坏）、不做 cleanName 剥后缀（用户明确要帖子里的文件名，别擅自改）。
+        if (preserveName) {
+            val safe = fileName
+                .replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001F\\uFFFD]"), "_")
+                .trim()
+            if (safe.isNotBlank()) {
+                // 仅按文件真实类型补扩展名（帖子名有时无后缀），不改动主体
+                val dotIdx = safe.lastIndexOf('.')
+                val hasExt = dotIdx > 0 && safe.substring(dotIdx).lowercase() in setOf(
+                    ".txt", ".zip", ".epub", ".pdf", ".rar", ".7z", ".gz",
+                    ".mobi", ".azw3", ".azw", ".chm", ".umd", ".html", ".htm",
+                    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"
+                )
+                if (hasExt || fileType.ext.isEmpty()) return safe
+                return safe + fileType.ext
+            }
+        }
+
         // 书名兜底/正常中文文件名：已是正确中文，跳过 fixEncoding 的多编码猜测（避免把正常书名再"解码"坏）。
         // 仅当文件名疑似乱码（无中文或含乱码特征）时才走 fixEncoding 尝试还原。
         val hasHanzi = fileName.any { it in '\u4e00'..'\u9fff' }
@@ -837,6 +963,39 @@ object DownloadHelper {
         return m?.groupValues?.get(1)?.trim()?.replace(Regex("[\\\\/:*?\"<>|]"), "_")
     }
 
+    /**
+     * 从网页响应里抽出「人能看懂」的正文摘录，用于诊断日志。
+     *
+     * Discuz 的提示页（未登录/权限不足/附件失效）关键信息都在 `#messagetext` 或
+     * `.alert_error` 里，页面其它部分全是模板噪声。这里优先取该区域文本，
+     * 取不到再退回全文前段。按 GBK / UTF-8 双解码并挑中文更多的那个结果
+     * （搜书吧是 GBK 站点，直接用 UTF-8 解会全是乱码）。
+     */
+    private fun htmlExcerpt(body: ByteArray): String {
+        val candidates = mutableListOf<String>()
+        candidates.add(String(body, Charsets.UTF_8))
+        try { candidates.add(String(body, charset("GBK"))) } catch (_: Exception) {}
+        // 选「可读字符（汉字/字母/数字）最多」的解码结果
+        val text = candidates.maxByOrNull { s -> s.count { it.isLetterOrDigit() } } ?: return ""
+        val area = Regex(
+            "id\\s*=\\s*[\"']messagetext[\"'][^>]*>(.*?)</div>",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        ).find(text)?.groupValues?.get(1)
+            ?: Regex(
+                "class\\s*=\\s*[\"'][^\"']*alert_error[^\"']*[\"'][^>]*>(.*?)</div>",
+                setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+            ).find(text)?.groupValues?.get(1)
+            ?: text
+        val plain = area
+            .replace(Regex("(?is)<script.*?</script>"), " ")
+            .replace(Regex("(?is)<style.*?</style>"), " ")
+            .replace(Regex("<[^>]+>"), " ")
+            .replace("&nbsp;", " ").replace("&amp;", "&")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        return plain.take(200)
+    }
+
     /** 固定缓冲区复制并限制文件大小；超限时直接停止并删除临时文件。 */
     private fun copyLimitedToFile(
         input: InputStream,
@@ -898,37 +1057,77 @@ object DownloadHelper {
         }
     }
 
+    /**
+     * MediaStore 相对目录（**末尾必须带 '/'**）。
+     *
+     * 关键修复（v2.5.0）：原实现在写盘时用 `Download/<dir>`（无尾斜杠），而
+     * `ensureUniqueNameMediaStore` 与 `DownloadsActivity.loadFiles()` 都用
+     * `Download/<dir>/`（有尾斜杠）。RELATIVE_PATH 不一致会让「已写入的文件」在 App 的
+     * 下载列表里查不出来，表现为「Toast 说下载完成，但列表里没有文件」。
+     * 统一从这里取值，杜绝再次分叉。
+     */
+    private fun relPathFor(ctx: Context): String =
+        Environment.DIRECTORY_DOWNLOADS + "/" + Prefs.getDownloadDir(ctx) + "/"
+
     /** Android 10+：写入 MediaStore Downloads，无需权限，可在系统下载目录中查看。 */
     private fun saveViaMediaStore(ctx: Context, source: File, fileName: String, mimeType: String?) {
         val resolver = ctx.contentResolver
+        val relPath = relPathFor(ctx)
         val values = ContentValues().apply {
             put(MediaStore.Downloads.DISPLAY_NAME, fileName)
             put(MediaStore.Downloads.MIME_TYPE, mimeType ?: "application/octet-stream")
-            put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/" + Prefs.getDownloadDir(ctx))
+            put(MediaStore.Downloads.RELATIVE_PATH, relPath)
         }
         // 不再删除旧文件：文件名已由 ensureUniqueNameMediaStore 保证唯一，同名自动加 (1)(2) 后缀
         val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
             ?: throw IOException("无法创建下载文件")
+        val copied: Long
         try {
-            resolver.openOutputStream(uri)?.use { output ->
+            copied = resolver.openOutputStream(uri)?.use { output ->
                 FileInputStream(source).use { input -> copyStream(input, output) }
             } ?: throw IOException("无法写入文件")
         } catch (e: Throwable) {
-            resolver.delete(uri, null, null)
+            try { resolver.delete(uri, null, null) } catch (_: Exception) {}
             throw e
+        }
+        // 写后核验：确认 MediaStore 里确实有这条记录且字节数一致。
+        // 不核验的话，某些 ROM 上 insert 成功但 openOutputStream 静默截断，
+        // 会重演「提示下载完成、实际没有文件」的假成功。
+        val actual = mediaStoreSizeOf(ctx, fileName, relPath)
+        DebugLog.log("SAVE", "MediaStore 写入: $relPath$fileName | 复制=$copied B | 记录=$actual B")
+        if (actual == null) {
+            throw IOException("写入后未在下载目录找到该文件（$relPath$fileName）")
+        }
+        if (actual != copied) {
+            DebugLog.log("SAVE", "警告：记录大小($actual)与写入大小($copied)不一致")
         }
     }
 
-    /** 固定缓冲区流式复制，避免整本 TXT 读入内存。 */
-    private fun copyStream(input: InputStream, output: OutputStream) {
+    /** 查询 MediaStore 中某文件的 SIZE；不存在返回 null（用于写后核验） */
+    private fun mediaStoreSizeOf(ctx: Context, name: String, relativePath: String): Long? {
+        val projection = arrayOf(MediaStore.Downloads.SIZE)
+        val selection = MediaStore.Downloads.DISPLAY_NAME + "=? AND " + MediaStore.Downloads.RELATIVE_PATH + "=?"
+        return try {
+            ctx.contentResolver.query(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                projection, selection, arrayOf(name, relativePath), null
+            )?.use { if (it.moveToFirst()) it.getLong(0) else null }
+        } catch (e: Exception) { null }
+    }
+
+    /** 固定缓冲区流式复制，避免整本 TXT 读入内存。返回实际写入字节数。 */
+    private fun copyStream(input: InputStream, output: OutputStream): Long {
         val buffer = ByteArray(DOWNLOAD_BUFFER_SIZE)
+        var total = 0L
         while (true) {
             val count = input.read(buffer)
             if (count < 0) break
             if (count == 0) continue
             output.write(buffer, 0, count)
+            total += count.toLong()
         }
         output.flush()
+        return total
     }
 
     /**
@@ -936,7 +1135,7 @@ object DownloadHelper {
      * 保留旧文件、新文件用新名，避免覆盖丢失。
      */
     private fun ensureUniqueNameMediaStore(ctx: Context, fileName: String): String {
-        val relPath = Environment.DIRECTORY_DOWNLOADS + "/" + Prefs.getDownloadDir(ctx) + "/"
+        val relPath = relPathFor(ctx)   // 与写入、列表查询共用同一路径（尾斜杠一致）
         if (!mediaStoreNameExists(ctx, fileName, relPath)) return fileName
         val dot = fileName.lastIndexOf('.')
         val base = if (dot > 0) fileName.substring(0, dot) else fileName

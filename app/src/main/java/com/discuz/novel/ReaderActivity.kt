@@ -192,11 +192,14 @@ class ReaderActivity : AppCompatActivity() {
         btnPrevChapter.setOnClickListener { gotoPrevChapter() }
         btnNextChapter.setOnClickListener { gotoNextChapter() }
 
-        // 单击呼出/隐藏工具栏：手动检测 down-up，避免 GestureDetector 与 textIsSelectable 长按选择冲突
+        // 单击呼出/隐藏工具栏：手动检测 down-up，避免 GestureDetector 与系统手势冲突。
+        // 注意：必须挂在 scrollView 而不是 tvContent 上——正文 setTextIsSelectable(false) 后
+        // tvContent 不再 clickable，不会再消费 ACTION_DOWN，事件会被 ScrollView 接管，
+        // 结果 tvContent 收不到 ACTION_UP，单击永远不触发。挂到 scrollView 才能稳定收到整对 down/up。
         var downX = 0f
         var downY = 0f
         var downTime = 0L
-        tvContent.setOnTouchListener { _, event ->
+        scrollView.setOnTouchListener { _, event ->
             when (event.actionMasked) {
                 android.view.MotionEvent.ACTION_DOWN -> {
                     downX = event.x
@@ -212,11 +215,11 @@ class ReaderActivity : AppCompatActivity() {
                     }
                 }
             }
-            false // 不消费事件，交回滚动 / 长按选择
+            false // 不消费事件，交回滚动
         }
 
-        // 长按选中文字复制（系统默认选择模式）
-        setupTextSelection()
+        // 禁用长按选择/复制：正文不可选中，并吞掉长按事件（不弹系统选择菜单）
+        disableTextSelection()
 
         // 连续滚动：接近窗口底部/顶部时动态加载相邻章，跨章无缝
         scrollView.setOnScrollChangeListener { _, _, scrollY, _, _ ->
@@ -270,9 +273,26 @@ class ReaderActivity : AppCompatActivity() {
         bottomBar.visibility = if (bottomBarVisible) View.VISIBLE else View.GONE
     }
 
-    /** 启用长按选中文字 + 复制（系统默认选择模式）。 */
-    private fun setupTextSelection() {
-        tvContent.setTextIsSelectable(true)
+    /**
+     * 禁用长按选择/复制：正文不可被选中，长按不弹系统选择菜单，也不触发 ActionMode。
+     * 覆盖 3 个层面，避免不同 ROM 上残留长按菜单：
+     * 1) setTextIsSelectable(false)：关掉可选择状态（这是之前被显式打开的那一项）
+     * 2) isLongClickable=false：长按不被消费，无菜单也无震动反馈
+     * 3) 自定义选择回调返回 false：旧 ROM 走 selection ActionMode 时也一律拦掉
+     */
+    private fun disableTextSelection() {
+        tvContent.setTextIsSelectable(false)
+        tvContent.isLongClickable = false
+        val block = object : android.view.ActionMode.Callback {
+            override fun onCreateActionMode(mode: android.view.ActionMode?, menu: android.view.Menu?): Boolean = false
+            override fun onPrepareActionMode(mode: android.view.ActionMode?, menu: android.view.Menu?): Boolean = false
+            override fun onActionItemClicked(mode: android.view.ActionMode?, item: android.view.MenuItem?): Boolean = false
+            override fun onDestroyActionMode(mode: android.view.ActionMode?) {}
+        }
+        tvContent.customSelectionActionModeCallback = block
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            tvContent.customInsertionActionModeCallback = block
+        }
     }
 
     private fun isActivityDead(): Boolean {
