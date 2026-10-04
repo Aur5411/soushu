@@ -91,6 +91,9 @@ class MainActivity : AppCompatActivity() {
      */
     @Volatile private var entryTrustedHost: String? = null
 
+    /** 最近一次已做 DNS 预取的域名，避免每次加载都重复起线程（v2.7.0） */
+    @Volatile private var lastPrefetchedHost: String? = null
+
     /**
      * 是否已经发起过「直达最新地址」的跳转。
      * 一旦发出，说明入口链路已经走通、目标就是论坛，此时应给页面更宽的加载时间；
@@ -174,6 +177,35 @@ class MainActivity : AppCompatActivity() {
         disarmEntryWatchdog()
     }
 
+    /**
+     * DNS 预取（v2.7.0 补齐）——之前只在注释里写了「DNS 预取 + 预连接」，并没有实现。
+     *
+     * 搜书吧的论坛域名是**动态轮换**的（今天还是 `xxx.b4e5w4dqwde.com`，明天就换一个），
+     * 而且不少地区运营商的 DNS 解析本身就慢 100~800ms。用户在首页点分区时，
+     * 系统要先做一次 DNS 查询才能建连，这段时间界面完全没有反馈 —— 正是「点了没反应、
+     * 像要点两下」的观感来源之一。
+     *
+     * 做法：页面开始加载时，在后台线程把当前域名的 A 记录先解析出来（系统 DNS 缓存命中后续请求），
+     * 等用户真的点进去时建连几乎立刻开始。纯后台预热，不改变任何请求顺序与结果。
+     */
+    private fun prefetchDns() {
+        val host = try {
+            val u = webView.url ?: Prefs.getUrl(this)
+            Uri.parse(u).host
+        } catch (e: Exception) { null }
+        if (host.isNullOrBlank() || host == lastPrefetchedHost) return
+        lastPrefetchedHost = host
+        Thread {
+            try {
+                // 只做解析预热，不建立连接、不发请求；失败静默（离线时正常现象）
+                java.net.InetAddress.getByName(host)
+                DebugLog.log("PAGE", "DNS 预取完成: $host")
+            } catch (e: Exception) {
+                // 解析失败不影响后续正常加载，无需处理
+            }
+        }.apply { isDaemon = true; priority = Thread.MIN_PRIORITY; start() }
+    }
+
     @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
     private fun setupWebView() {
         val settings = webView.settings
@@ -200,16 +232,25 @@ class MainActivity : AppCompatActivity() {
         settings.userAgentString = buildUserAgent()
         cachedUserAgent = settings.userAgentString
 
-        // ===== 浏览提速优化 =====
-        // 1) HTTP 缓存持久化：WebView 默认即启用 HTTP 磁盘缓存（存于 cacheDir），
-        //    LOAD_DEFAULT 模式会遵循响应头缓存策略；Discuz 论坛的 CSS/JS/图片变化很小，
-        //    命中缓存即可让帖子间切换、重复进板块明显变快。
-        //    （不手动 setAppCachePath，那是已废弃的 HTML5 AppCache，非 HTTP 缓存，避免告警/兼容风险）
-        // 2) DNS 预取 + 预连接：提前解析论坛域名，降低建连延迟。
+        // ===== 浏览提速优化（v2.7.0 补齐）=====
+        // 1) HTTP 缓存：WebView 默认即启用 HTTP 磁盘缓存（存于 cacheDir），
+        //    LOAD_DEFAULT 遵循响应头缓存策略；Discuz 论坛的 CSS/JS/图片变化很小，
+        //    命中缓存即可让帖子间切换、重复进分区明显变快。
+        //    注：WebView 没有「设置缓存大小」的公开 API（只有 clearCache），
+        //    缓存上限由系统按设备存储分配，不可调 —— 曾经误用 setCacheSize 编译不过。
+        //    能真正提升命中率的开关是 cacheMode：列表翻页时优先用缓存、网络后台补齐。
         try {
-            // 关闭地理位置（用不到，省去权限与额外开销）
+            settings.cacheMode = WebSettings.LOAD_CACHE_ELSE_NETWORK
+        } catch (e: Exception) { }
+        // 2) 渲染优先级调高：让 WebView 与主线程争 CPU 时优先给渲染管线，滑动更跟手
+        try {
+            settings.setRenderPriority(WebSettings.RenderPriority.HIGH)
+        } catch (e: Exception) { }
+        // 3) 关掉用不到的开销
+        try {
+            // 地理位置：用不到，省去权限与额外开销
             settings.setGeolocationEnabled(false)
-        } catch (e: Exception) { /* 忽略 */ }
+        } catch (e: Exception) { }
 
         // 安全加固：关闭本地文件访问，防止网页读取本地文件
         settings.allowFileAccess = false
@@ -227,6 +268,8 @@ class MainActivity : AppCompatActivity() {
                 progressBar.visibility = View.VISIBLE
                 // 记录最近的内容页（非下载候选页）作为下载请求的 Referer
                 if (url != null && !isDownloadCandidate(url)) lastContentPageUrl = url
+                // 后台预解析域名：用户点分区/帖子时能省掉一段 DNS 等待（v2.7.0）
+                prefetchDns()
                 DebugLog.log("PAGE", "加载开始: $url")
             }
 
@@ -234,7 +277,7 @@ class MainActivity : AppCompatActivity() {
                 progressBar.visibility = View.GONE
                 swipeRefresh.isRefreshing = false
                 if (DebugLog.isEnabled()) injectClickLogger()
-                ScriptManager.inject(this@MainActivity, webView)
+                ScriptManager.inject(this@MainActivity, webView, url)
                 autoJumpToForum()
                 // 已到达真正的论坛/内容页才算进入成功：
                 // 必须是 http(s) 的真实页面(排除 about:blank / data: 等内部空页)，且不再属于“发布链路”域名。
@@ -261,6 +304,8 @@ class MainActivity : AppCompatActivity() {
                     startDirectAttachment(url)
                     return true
                 }
+                // 外链推广分区：先于站外判断拦下（点它时先停在站内 fid，由服务端再 301）
+                if (interceptExternalForum(url)) return true
                 if (interceptExternalNav(url)) return true
                 return handleUrl(url)
             }
@@ -278,6 +323,8 @@ class MainActivity : AppCompatActivity() {
                         startDirectAttachment(url)
                         return true
                     }
+                    // 外链推广分区：先于站外判断拦下
+                    if (interceptExternalForum(url)) return true
                     if (interceptExternalNav(url)) return true
                 }
                 return url?.let { handleUrl(it) } ?: false
@@ -826,6 +873,28 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * 拦截指向「外链推广分区」的导航。
+     *
+     * 页面里的版块入口已由注入脚本摘掉，但面包屑、最新回复、搜索结果里仍可能留下这些 fid 的链接；
+     * 这类分区是 Discuz 的「外部链接（redirect）」型，进去就是站外推广站，一律就地拦下并给一句提示。
+     *
+     * 必须排在 [interceptExternalNav] **之前**判定：点外链分区时浏览器先停在站内
+     * `forum.php?mod=forumdisplay&fid=N`，由服务端回301/302 才跳站外。
+     * 若先跑站外判断，这次站内请求不会被拦，页面会闪一下才跳走。
+     */
+    private fun interceptExternalForum(url: String): Boolean {
+        if (!AdBlocker.isHiddenForumUrl(url)) return false
+        val name = AdBlocker.forumNameOf(AdBlocker.forumIdOf(url))
+        DebugLog.log("NAV", "拦截外链推广分区: $url")
+        Toast.makeText(
+            this,
+            if (name != null) "「$name」是外链推广站，已屏蔽" else "该版块为外链推广站，已屏蔽",
+            Toast.LENGTH_SHORT
+        ).show()
+        return true
+    }
+
+    /**
      * 安全加固：拦截站外 http(s) 链接，交给系统浏览器打开（不在 App 内 WebView 加载），
      * 避免 JS 桥暴露给任意第三方页面。论坛主站域名(设置/最近页面)与发布入口域名放行。
      */
@@ -921,6 +990,26 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun logClick(info: String?) {
             if (!info.isNullOrBlank()) DebugLog.log("CLICK", info)
+        }
+
+        /**
+         * 页面清理脚本发现的「外链推广分区」fid（逗号分隔）转交 [AdBlocker] 记账。
+         *
+         * 这样站点新增外链分区时，**导航层拦截（面包屑/最新回复/搜索结果里的残留链接）
+         * 也会自动跟上**，不必改代码重装。参数来自页面自身文本，无需校验。
+         */
+        @JavascriptInterface
+        fun reportExternalForums(csv: String?) {
+            if (csv.isNullOrBlank()) return
+            AdBlocker.rememberExternalFids(csv)
+        }
+
+        /**
+         * 页面清理脚本上报的外链分区名，让拦截提示能说出具体是哪个分区（如「赚币攻略是外链推广站」）。
+         */
+        @JavascriptInterface
+        fun reportExternalForumName(fid: Int, name: String?) {
+            AdBlocker.rememberForumName(fid, name)
         }
 
         @JavascriptInterface

@@ -6,23 +6,36 @@ import android.webkit.WebView
 /**
  * 页面脚本注入管理（每个页面加载完成后执行）：
  * 1. 去广告预设脚本（始终开启）
- * 2. 用户自定义 JS 脚本（设置页可配置）
+ * 2. 外链推广分区屏蔽（[AdBlocker]，始终开启）
+ * 3. 用户自定义 JS 脚本（设置页可配置）
  *
  * 注：原内置的「搜书吧免银币下载 2.0」改链脚本与夜间模式 CSS 已按需求删除，
  * 应用不再内置其它任何脚本。
  */
 object ScriptManager {
 
-    /** 页面加载完成后统一入口：注入去广告脚本 + 自定义脚本 */
-    fun inject(ctx: Context, webView: WebView) {
-        val js = buildJs(ctx)
+    /** 页面加载完成后统一入口：注入去广告脚本 + 自定义脚本。
+     *
+     *  [url] 为当前页面地址，用于「外链分区屏蔽」只作用于首页（见 [AdBlocker.isForumHomePage]）。 */
+    fun inject(ctx: Context, webView: WebView, url: String? = null) {
+        val js = buildJs(ctx, url)
         if (js.isNotBlank()) webView.evaluateJavascript(js, null)
     }
 
-    private fun buildJs(ctx: Context): String {
+    private fun buildJs(ctx: Context, url: String? = null): String {
         val sb = StringBuilder()
         sb.append(adBlockJs())
         sb.append('\n')
+        // 帖子/分区点击提速（必须最先注入，见 singleTapFixJs 的说明）
+        sb.append(singleTapFixJs())
+        sb.append('\n')
+        // 外链推广分区（点了就302 到站外推广站的分区）整块摘除 —— **仅在论坛首页生效**。
+        // 判据是 Discuz 官方文案「链接到外部地址」，与 fid 无关，站点新增外链分区自动命中；
+        // 页面门禁保证分区页 / 帖子页 / 主题页一律不受影响。
+        if (AdBlocker.isForumHomePage(url)) sb.append(AdBlocker.cleanupJs()).append('\n')
+        // 隐藏主题列表里的站内内容广告帖（判据：标题链接 tid 非数字，即 Discuz content广告位插件）。
+        // 这类帖只出现在分区主题列表页，所以门禁与上面的首页门禁分开。
+        if (AdBlocker.isThreadListPage(url)) sb.append(AdBlocker.contentAdJs()).append('\n')
         sb.append(floatCloseFixJs())
         sb.append('\n')
         // 自动回复固定启用：与桌面自动回复脚本 v2.2.6 保持一致
@@ -46,6 +59,72 @@ object ScriptManager {
     }
 
     // ---------------- Discuz 预设脚本 ----------------
+
+    /**
+     * 修「分区/帖子要点两下才进去」（v2.7.0）。
+     *
+     * 根因来自 Discuz 官方脚本 `static/js/forum.js:289`：
+     * ```
+     * function atarget(obj) {
+     *   obj.target = getcookie('atarget') > 0 ? '_blank' : '';
+     * }
+     * ```
+     * 主题列表里每个帖子链接都写了 `onclick="atarget(this)"`。它把 `target` 改成**空字符串**，
+     * 而本App 为了接住跳转页的 `window.open` / `target=_blank` 开启了
+     * `setSupportMultipleWindows(true)` —— 多窗口模式下 `target=''` 同样会触发 `onCreateWindow`。
+     * 于是每次点击的实际链路是：
+     * ```
+     * 点一下 → onCreateWindow → 新建一个临时 popup WebView → popup 才开始请求
+     *      → onPageStarted 里才 webView.loadUrl(url) → 页面终于出现
+     * ```
+     * 中间**多了一次 WebView 创建 + 一整轮网络请求**，主界面在 popup 请求完成前毫无反应，
+     * 用户感知就是「点了没进去，再点一次」。第二次点击时页面已在前台，所以才「正常」。
+     *
+     * 修法：把 `atarget` 提前重定义成**同步把 target 定为 `_self`**。
+     * 这样点击直接由主 WebView 处理，不进 onCreateWindow，少掉整整一跳。
+     *
+     * 注意：
+     *  - 必须保留 `window.atarget`，Discuz 页面里还有 `setatarget()` 的开关 UI 依赖它；
+     *  - 只改站内 http(s) 链接的 target，外链（站外推广站）仍交给原生拦截，不受影响；
+     *  - 用捕获阶段监听 click 而不是改写每个元素的 onclick，改写会被 Discuz 重新渲染覆盖。
+     */
+    private fun singleTapFixJs(): String {
+        return """
+(function(){
+  if(window.__dzSingleTap) return; window.__dzSingleTap=1;
+  // Discuz 的 atarget：把「异步改写 target」换成「同步定为_self」，点击不再产生新窗口请求
+  try{
+    window.atarget=function(obj){
+      try{
+        if(!obj) return;
+        obj.target='_self';
+        // 站点若开启了「新窗口打开帖子」开关（atarget cookie），这里尊重用户选择不强制
+        // —— 但 App 内本来就用同一个 WebView 承载，保持 _self 才能走单次点击直达。
+      }catch(e){}
+    };
+  }catch(e){}
+  // 捕获阶段兜底：万一 Discuz 用别的方式（内联 onclick 已被缓存、AJAX 重渲染）改了 target，
+  // 点击瞬间同步纠正，保证链接在主 WebView 内直接打开。
+  try{
+    document.addEventListener('click', function(ev){
+      var a=null;
+      try{ a=ev.target && ev.target.closest ? ev.target.closest('a[href]') : null; }catch(e){ a=null; }
+      if(!a) return;
+      var href=a.getAttribute('href')||'';
+      if(!href || href.charAt(0)==='#') return;
+      // 只处理站内页面链接。站内链接既有绝对路径(https://host/...)也有相对路径(portal.php?mod=xx)，
+      // 相对路径在多窗口模式下同样会走 onCreateWindow，所以不能只按 http(s) 前缀筛。
+      // 排除协议类(非 http/https)即可 —— 原生层仍会照常拦截站外外链。
+      if(/^[a-z][a-z0-9+.-]*:/i.test(href) && !/^https?:/i.test(href)) return;
+      var t=a.getAttribute('target')||'';
+      // 空 target 或 _self 都属主WebView 直开；仅当仍是 _blank 时才需要纠正
+      if(t!=='_blank') return;
+      try{ a.setAttribute('target','_self'); }catch(e){}
+    }, true);
+  }catch(e){}
+})();
+""".trimIndent()
+    }
 
     /**
      * 隐藏 Discuz 常见广告容器与联盟广告。
