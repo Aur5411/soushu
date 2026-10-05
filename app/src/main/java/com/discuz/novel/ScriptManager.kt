@@ -525,7 +525,7 @@ object ScriptManager {
       var scope=getFirstFloor()||document;
 
       if(payBtnCache===null) payBtnCache=hasPayButton(scope);   // 只扫一次
-      if(payBtnCache){ log('楼主层有付费按钮，脚本不生效'); return; }
+      if(payBtnCache){ log('楼主层有付费/附件门控，脚本不生效'); return; }
       if(lockedHintCache===null) lockedHintCache=hasLockedHint(scope);   // 只扫一次
       if(!lockedHintCache){ log('未检测到隐藏提示'); return; }
       log('检测到隐藏提示，需要回复');

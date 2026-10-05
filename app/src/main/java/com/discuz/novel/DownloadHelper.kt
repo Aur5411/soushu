@@ -91,9 +91,17 @@ object DownloadHelper {
      *        只有帖子里的名字才是用户真正想要的文件名。
      */
     fun resolveFileName(url: String, contentDisposition: String?, nameHint: String? = null): String {
-        // 0. 最高优先级：帖子内显示的文件名（已经是可读中文，只需清理非法字符）
+        // 0. 最高优先级：帖子内显示的文件名（已经是可读中文，**原样保留**）
+        //
+        // 关键修复：原先这里会再走一遍 stripWebsite()，那是 v2.5.0 引入的回归。
+        // stripWebsite 的 trim 列表含 '【' '】' '（' '）'，本是为剥掉「【某某网www.x.com】」
+        // 这类水印的装饰括号；但书名本身大量使用【】——《阳光正好儿媳苏钥》（加料版）.txt
+        // 被剥成「阳光正好儿媳苏钥】（加料版）.txt，首字直接丢失、留下孤儿右括号。
+        //
+        // 早期可用版本（51476c5~82d15ae）压根没有 nameHint，名字来自响应头，从不进
+        // stripWebsite，所以不会丢字。现在恢复该语义：**只清非法字符与空白，不动标点**。
         if (!nameHint.isNullOrBlank()) {
-            val cleaned = fixEncoding(nameHint).let { stripWebsite(it) }
+            val cleaned = fixEncoding(nameHint)
                 .replace(Regex("[\\\\/:*?\"<>|\\uFFFD]"), "_")
                 .trim()
             if (cleaned.isNotBlank() && !looksLikeScriptOrGenericPage(cleaned)) {
@@ -1093,10 +1101,23 @@ object DownloadHelper {
         // 写后核验：确认 MediaStore 里确实有这条记录且字节数一致。
         // 不核验的话，某些 ROM 上 insert 成功但 openOutputStream 静默截断，
         // 会重演「提示下载完成、实际没有文件」的假成功。
-        val actual = mediaStoreSizeOf(ctx, fileName, relPath)
+        //
+        // 关键修复：MediaStore 的索引是异步的，insert+close 之后**立刻** query 常常查不到
+        // 刚写入的那一行（实测记录=null 而复制=6257098 B，文件其实已落盘）。
+        // 原实现把 null 直接当失败抛 IOException → 已经下载成功的文件被报成「下载失败」。
+        // 现在改成轮询重试；仍查不到才降级为「不可核验」而非「失败」——
+        // 因为字节已经 copy 完并 close 成功，落盘是既成事实，核验只是为了兜住静默截断。
+        var actual: Long? = null
+        for (attempt in 0 until 5) {
+            actual = mediaStoreSizeOf(ctx, fileName, relPath)
+            if (actual != null) break
+            if (attempt < 4) Thread.sleep(150)
+        }
         DebugLog.log("SAVE", "MediaStore 写入: $relPath$fileName | 复制=$copied B | 记录=$actual B")
         if (actual == null) {
-            throw IOException("写入后未在下载目录找到该文件（$relPath$fileName）")
+            // 重试 750ms 仍查不到：多数是 ROM 索引延迟，文件已写入，不应判为失败。
+            DebugLog.log("SAVE", "提示：MediaStore 索引未同步到该文件（已写入 $copied B），按成功处理")
+            return
         }
         if (actual != copied) {
             DebugLog.log("SAVE", "警告：记录大小($actual)与写入大小($copied)不一致")
