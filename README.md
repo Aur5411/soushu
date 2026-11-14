@@ -6,6 +6,7 @@
 
 - **可配置网址**：首次打开进入设置页填写论坛地址，之后启动直达论坛
 - **发布页自动进论坛**：未配置网址时从发布入口页自动找「最新地址」直达论坛，进入后自动把论坛域名记入设置；论坛动态域名（如 `dq3s.b4e5w4dqwde.com`）会被登记为可信域名后再跳转，不再被「站外链接转系统浏览器」误踢出去
+- **入口链路强容错（v2.6.1）**：发布页→最新地址→论坛是 3 跳 meta-refresh 链，弱网下常在 3~6 秒才渲染出链接。现按「页面进展心跳」判活（无进展满 9 秒才回落，链路总上限 45 秒），链接轮询预算 20 秒；保存的论坛域名轮换失效后自动回落发布页重新取新域名，不再停在发布页或白屏
 - **电脑版网页**：默认桌面 UA，进入网站即为 PC 版完整页面
 - **内置 TXT 阅读器（连续滚动）**：txt 文件默认用内置阅读器打开，章节无缝连续滚动、跨章无跳变，支持章节目录、字号/行距/背景主题、阅读位置记忆，支持 UTF-8 / UTF-16 / GBK
 - **多格式文件下载**：下载文件自动保留真实后缀（`.txt` `.zip` `.epub` `.pdf` `.rar` `.7z` 等），其余格式用外部软件打开
@@ -55,7 +56,7 @@
 ```bash
 # 前置：JDK 17 + Android SDK
 # 配置 SDK 路径：编辑 local.properties，把 sdk.dir 改为本机 Android SDK 路径
-cd DiscuzForumApp
+cd soushu
 gradlew assembleRelease   # 产物：app/build/outputs/apk/release/app-release.apk
 ```
 
@@ -69,12 +70,17 @@ gradlew assembleRelease   # 产物：app/build/outputs/apk/release/app-release.a
 ```
 app/src/main/
 ├── java/com/discuz/novel/
-│   ├── MainActivity.kt        # 主页：WebView、菜单、下载拦截网、JS 桥接
+│   ├── MainActivity.kt        # 主页：WebView、入口链路容错、菜单、下载拦截网、JS 桥接
 │   ├── SettingsActivity.kt    # 设置页
 │   ├── DownloadsActivity.kt   # App 内下载管理
 │   ├── ReaderActivity.kt      # 内置 TXT 阅读器
 │   ├── DownloadHelper.kt      # 自研下载器：探测 + 重定向 + 文件名处理
 │   ├── ScriptManager.kt       # 脚本注入：去广告 + 自动回复 + 自定义脚本
+│   ├── AdBlocker.kt           # 外链分区 / content 广告帖屏蔽
+│   ├── DownloadRecords.kt     # 下载记录持久化
+│   ├── HistoryActivity.kt     # 浏览历史页
+│   ├── HistoryStore.kt        # 浏览历史存储
+│   ├── DebugLog.kt            # 调试日志
 │   └── Prefs.kt               # SharedPreferences 配置读写
 └── res/
     ├── layout/                # 各页面布局
@@ -82,6 +88,24 @@ app/src/main/
     ├── xml/                   # FileProvider 路径
     └── drawable/              # 图标等资源
 ```
+
+## 更新记录
+
+### v2.6.1（入口链路强容错）
+
+发布页 → 最新地址 → 论坛是 3 跳 meta-refresh 链，`soushu2030.com` 常返回 403（证书过期）、
+中间跳返回 404 但 body 完整、只有 `.link-box` 里的链接才是真入口。弱网/新域名下 hop3 的 DOM
+常在 3~6 秒才就绪，原实现留的容错不够，升级用户表现为停在发布页或白屏。本版重构入口时序：
+
+- 链接轮询预算 4 次 × 550ms（≈2.2s）→ 40 次 × 500ms（≈20s），每轮刷新进展心跳
+- 一次性 6 秒看门狗（到点即判失败重载）→ 按「无进展满 9 秒」才回落，另加 45 秒链路总上限防 redirect 循环
+- 保存的论坛域名轮换失效后自动回落发布页重新取新域名（原逻辑 `if (!entryMode) return` 直接吞掉失败）
+- `isEntryHostUrl` 的 `contains("book/")` / `contains("/o/")` 误判改为两级判定：主机名标记优先，路径标记只对非已知论坛域名生效
+- 入口阶段用 `LOAD_NO_CACHE`（hop1 是无 Cache-Control/ETag 的 403，必须拿新鲜响应），进论坛后恢复 `LOAD_CACHE_ELSE_NETWORK`
+
+### v2.6.0
+
+去除论坛广告 + 修「分区得点两下才进去」+ 浏览提速；修复文件名丢失书名首字 + 下载成功被误报失败。
 
 ## License
 

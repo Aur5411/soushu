@@ -81,8 +81,25 @@ class MainActivity : AppCompatActivity() {
     private var entryWatchdog: Runnable? = null   // 进入超时看门狗(覆盖“停在 about:blank 无错误回调”的静默失败)
     private val ENTRY_MAX_RETRY = 3
     private val ENTRY_RETRY_DELAY_MS = 1500L
-    private val ENTRY_WATCHDOG_MS = 6000L   // 进入窗口内未到达内容页视为一次失败
-    private val entryHostMarkers = listOf("soushu2030", "soushufabu", "allshu", ".soushu", "book/", "/o/")
+    private val ENTRY_WATCHDOG_MS = 6000L   // 无任何页面进展超过该时长才算一次失败
+    private val ENTRY_WATCHDOG_AFTER_JUMP_MS = 15000L
+    /** 固定入口发布页（域名会轮换，但这一跳长期存在） */
+    private val ENTRY_URL = "https://www.soushu2030.com"
+    /**
+     * 自动跳转轮询预算：真实链路是 3 跳 meta-refresh + 最后一跳发布页，
+     * 弱网/首屏慢时带 .link-box 的 DOM 常在 3~8s 才就绪。
+     * 原来只查 4 次(≈2.2s)就彻底放弃，是「明明有链接却不跳」的直接原因。
+     */
+    private val ENTRY_POLL_MAX_ATTEMPTS = 40
+    private val ENTRY_POLL_INTERVAL_MS = 500L
+    /** 已保存论坛网址的冷启动兜底：这么久没加载出任何真实页面就回落发布页链路 */
+    private val ENTRY_STARTUP_FALLBACK_MS = 9000L
+    /** 单次入口链路总时长上限：防止站点把入口做成 redirect 循环时无限续命 */
+    private val ENTRY_CHAIN_MAX_MS = 45000L
+    /** 主机名标记：命中即认为仍处于「发布链路」 */
+    private val entryHostMarkers = listOf("soushu2030", "soushufabu", "allshu", ".soushu")
+    /** 路径标记：仅在主机名未知（新轮换的发布页）时才作为判定依据 */
+    private val entryPathMarkers = listOf("book/", "/o/")
 
     /**
      * 发布页「最新地址」自动跳转命中的论坛主机名。
@@ -100,7 +117,22 @@ class MainActivity : AppCompatActivity() {
      * 否则论坛本身响应慢（>6s）时看门狗会误判失败并重启整条链路，反复来回永远进不去。
      */
     @Volatile private var autoJumpIssued = false
-    private val ENTRY_WATCHDOG_AFTER_JUMP_MS = 15000L
+
+    /**
+     * 入口链路「进展心跳」：每成功加载完一个页面（含 meta-refresh 中间页）就刷新。
+     * 看门狗依据它判断链路是否还在推进 —— 只要页面还在往前走就不算失败，
+     * 避免慢网下把正在正常跳转的链路误判成「打不开」而反复重启。
+     */
+    @Volatile private var lastEntryProgressTs = 0L
+
+    /** 本次入口链路开始时间，用于限制链路总时长（防 redirect 循环） */
+    @Volatile private var entryChainStartTs = 0L
+
+    /** 已保存论坛网址的冷启动兜底定时器 */
+    private var startupFallback: Runnable? = null
+
+    /** 最近一次「真实页面加载完成」的时间戳，用于判断保存的网址是否已经打不开 */
+    @Volatile private var lastLoadedPageTs = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -239,9 +271,12 @@ class MainActivity : AppCompatActivity() {
         //    注：WebView 没有「设置缓存大小」的公开 API（只有 clearCache），
         //    缓存上限由系统按设备存储分配，不可调 —— 曾经误用 setCacheSize 编译不过。
         //    能真正提升命中率的开关是 cacheMode：列表翻页时优先用缓存、网络后台补齐。
-        try {
-            settings.cacheMode = WebSettings.LOAD_CACHE_ELSE_NETWORK
-        } catch (e: Exception) { }
+        // ⚠️ v2.6.1：入口链路（发布页 → 最新地址）必须拿新鲜响应。
+        //    发布入口 hop1 返回 403 且**不带 Cache-Control/ETag/Last-Modified**，
+        //    这类响应在 LOAD_CACHE_ELSE_NETWORK 下会被当成「缓存可用」反复吃旧页，
+        //    而 sigin 是一次性跳转参数，吃旧页＝永远拿不到下一跳。所以入口阶段用 LOAD_DEFAULT，
+        //    真正进论坛后再切回缓存优先（见 applyCacheMode / endForumEntry）。
+        applyCacheMode(forumMode = false)
         // 2) 渲染优先级调高：让 WebView 与主线程争 CPU 时优先给渲染管线，滑动更跟手
         try {
             settings.setRenderPriority(WebSettings.RenderPriority.HIGH)
@@ -277,12 +312,20 @@ class MainActivity : AppCompatActivity() {
                 progressBar.visibility = View.GONE
                 swipeRefresh.isRefreshing = false
                 if (DebugLog.isEnabled()) injectClickLogger()
+                // 入口链路进展心跳：任何一个页面（含 meta-refresh 中间页）加载完都算前进，
+                // 看门狗据此判断链路是否还在推进，避免慢网下误判失败重启。
+                if (entryMode && isRealHttpPage(url)) lastEntryProgressTs = System.currentTimeMillis()
+                if (isRealHttpPage(url)) {
+                    lastLoadedPageTs = System.currentTimeMillis()
+                    disarmStartupFallback()
+                }
                 ScriptManager.inject(this@MainActivity, webView, url)
                 autoJumpToForum()
                 // 已到达真正的论坛/内容页才算进入成功：
-                // 必须是 http(s) 的真实页面(排除 about:blank / data: 等内部空页)，且不再属于“发布链路”域名。
+                // 必须是 http(s) 的真实页面(排除 about:blank / data: 等内部空页)，
+                // 且已经落在论坛域名上（保存的网址 / 曾进入过的域名 / 本次刚登记的域名）。
                 // 注意不能凭 about:blank 就退出——meta-refresh/发布页跳转瞬间会经过空白页，误判会关掉重试窗口。
-                if (entryMode && isRealHttpPage(url) && !isEntryHostUrl(url)) {
+                if (entryMode && isRealHttpPage(url) && isKnownForumHost(url)) {
                     endForumEntry(success = true)
                     rememberForumUrl(url)
                 }
@@ -339,7 +382,14 @@ class MainActivity : AppCompatActivity() {
                 DebugLog.log("ERROR", "$code $desc @ ${req?.url} main=${req?.isForMainFrame}")
                 // 仅主 frame 的网络级失败才考虑“打不开”重试（子资源/图片失败不触发）
                 if (req != null && req.isForMainFrame && isEntryNetworkError(code)) {
-                    recordEntryFailure()
+                    // 非入口窗口（用已保存网址冷启动）时，这里过去被 recordEntryFailure 第一行直接吞掉，
+                    // 页面就永远空白。现在只要保存的网址打不开，立刻回落发布页链路重新拿最新域名。
+                    if (!entryMode && lastLoadedPageTs == 0L) {
+                        DebugLog.log("ENTRY", "保存的网址网络失败($code)，回落发布页链路")
+                        startEntryChain()
+                    } else {
+                        recordEntryFailure()
+                    }
                 }
             }
 
@@ -637,6 +687,7 @@ class MainActivity : AppCompatActivity() {
      * 时间防抖：2 秒内不重复点击，规避同页多次 onPageFinished 造成的连点/抖动。
      */
     private var lastAutoJumpTs = 0L
+    private var lastAutoJumpPageUrl: String? = null
     private var autoJumpAttempt = 0
     private val autoJumpPollRunnable = Runnable { runAutoJumpPoll(webView.url) }
 
@@ -663,27 +714,38 @@ class MainActivity : AppCompatActivity() {
      * 兼容两种入口形态：
      *  - 发布页直接含 .link-box（当前 soushu2030 返回的形态，链接为静态 HTML）；
      *  - 发布页先经 meta/JS 跳到另一中间页才出现链接（结构随入口域名轮换变化）。
-     * 做法：onPageFinished 触发一次 + 在稳定后延迟轮询最多 4 次，防「onPageFinished 触发瞬间
-     * 页面正跳 about:blank / 链接晚注入」导致查不到。命中即 window.location.href 主框架直达论坛，
-     * 绕开 target=_blank 的 onCreateWindow→popup→转发链路（实测在发布页上不稳定）。
+     *
+     * ⚠️ 关键修复（v2.6.1）：原来这里有一道 `if (now - lastAutoJumpTs < 1500) return` 的**全局**防抖。
+     * 真实入口链路是 3 跳 meta-refresh，每跳只停 0.1s，整条链 <1s 走完 ——
+     * 于是 hop2、hop3 的 onPageFinished 全部落进同一个 1.5s 窗口被直接吞掉，
+     * 只有 hop1（空壳页、还没渲染出 .link-box）真正启动过轮询；等 4 次查空（≈2.2s）放弃后，
+     * 即使 hop3 上的「最新地址」已经渲染出来也再没有人去找它，用户只能停在日本发布页手动点。
+     * 现在防抖改为**按页面 URL**去重（同一页重复 onPageFinished 才忽略），翻到新页面一律重开轮询。
      */
     private fun autoJumpToForum() {
         // 仅在“冷启动进入论坛”这段入口窗口(entryMode)内才自动跳转；
         // 一旦成功进论坛(endForumEntry 已把 entryMode 置 false)，就彻底停手，
         // 否则帖子详情页里的「论坛/首页」链接会被误命中，把用户拽回主页。
         if (!entryMode) return
+        val pageUrl = webView.url
         val now = System.currentTimeMillis()
-        if (now - lastAutoJumpTs < 1500) return   // 同一入口页面防抖
+        if (pageUrl != null && pageUrl == lastAutoJumpPageUrl && now - lastAutoJumpTs < 800) return
+        lastAutoJumpPageUrl = pageUrl
         lastAutoJumpTs = now
         autoJumpAttempt = 0
         webView.removeCallbacks(autoJumpPollRunnable)
-        webView.postDelayed(autoJumpPollRunnable, 350)
+        webView.postDelayed(autoJumpPollRunnable, 250)
     }
 
     private fun runAutoJumpPoll(pageUrl: String?) {
         if (!entryMode) return   // 已离开入口窗口则不再轮询
-        // 若已到达真正论坛/内容页(非发布链路域名)，停止本页轮询
-        if (isRealHttpPage(pageUrl) && !isEntryHostUrl(pageUrl)) return
+        // 已经站在真正的论坛域名上（保存的网址 / 曾进入过的域名 / 本次刚登记的域名）就收工。
+        // ⚠️ 这里不再用 isEntryHostUrl 反判：发布页域名轮换很快，路径形态（/o/、/book/、/?）随时变，
+        // 一旦新形态没被 entryPathMarkers 覆盖，旧写法会在这里直接 return，正好把最该解决的场景漏掉。
+        if (isRealHttpPage(pageUrl) && isKnownForumHost(pageUrl)) return
+        // 每一轮轮询本身也算「链路在推进」：否则 6s 看门狗会在 20s 轮询预算用完之前
+        // 就把这次进入判成失败并整条链路重来，白等一轮。
+        if (isRealHttpPage(pageUrl)) lastEntryProgressTs = System.currentTimeMillis()
         autoJumpAttempt++
         val attempt = autoJumpAttempt
         // 第一阶段：只「找」不「跳」。跳转改由 Kotlin 在登记完目标域名之后再做 ——
@@ -755,9 +817,12 @@ class MainActivity : AppCompatActivity() {
                 webView.evaluateJavascript(jumpJs, null)
                 return@evaluateJavascript
             }
-            // 未命中且仍在入口链路，短暂后再查(链接可能晚注入)；最多约 4 次覆盖 ~2.5s
-            if (attempt < 4 && entryMode && info?.optBoolean("jumped", false) != true) {
-                webView.postDelayed(autoJumpPollRunnable, 550)
+            // 未命中且仍在入口链路，继续短间隔重查：真实发布页的 .link-box 常晚于 onPageFinished
+            // 数秒才渲染（中间页/慢网/字体样式阻塞），预算必须放大到 ~20s，否则又是「链接出现了没人找」。
+            if (attempt < ENTRY_POLL_MAX_ATTEMPTS && entryMode &&
+                info?.optBoolean("jumped", false) != true
+            ) {
+                webView.postDelayed(autoJumpPollRunnable, ENTRY_POLL_INTERVAL_MS)
             }
         }
     }
@@ -796,30 +861,68 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ============ 启动入口智能重试 ============
-    // 仅“冷启动通往论坛”链路生效。失败自动重试(上限 ENTRY_MAX_RETRY 次)，仍失败弹窗 + 手动重试。
+    // ============ 启动入口智能重试 ============    // 仅“冷启动通往论坛”链路生效。失败自动重试(上限 ENTRY_MAX_RETRY 次)，仍失败弹窗 + 手动重试。
     // 判定成功：onPageFinished 到达非发布链路域名(已进论坛/内容页) → endForumEntry(success=true)。
     // 进入论坛后普通浏览/断网不触发重试。
 
     /** 冷启动进入论坛：优先打开设置里填写的网址；为空才走「发布页 → 最新地址」自动跳转链路 */
     private fun beginForumEntry() {
-        // 用户在设置里配置了网址：直接进，不进 entryMode 重试窗口(普通浏览不打扰)。
+        disarmStartupFallback()
+        // 用户在设置里配置了网址：先直接试，但不进 entryMode 重试窗口(普通浏览不打扰)。
+        // ⚠️ v2.6.1：论坛域名是动态轮换的，保存的网址随时可能整站失效（DNS 直接不解析）。
+        // 原实现只要网址非空就 entryMode=false 死磕它，失败回调被 `if (!entryMode) return` 吞掉，
+        // 页面就永远空白 —— 升级安装的老用户必踩。现在加一道兜底：一段时间内没加载出任何真实页面，
+        // 就自动回落到「发布页 → 最新地址」链路重新拿新域名。
         val configured = Prefs.getUrl(this)
         if (configured.isNotBlank()) {
             entryMode = false
             entryFailCount = 0
             disarmEntryWatchdog()
             DebugLog.log("ENTRY", "使用设置网址进入: $configured")
+            lastLoadedPageTs = 0L
             loadUrl(configured)
+            armStartupFallback()
             return
         }
-        // 未配置网址：走固定入口发布页 + 自动跳转 + 智能重试
+        startEntryChain()
+    }
+
+    /** 走「固定入口发布页 → 发布导航页 → 最新地址」链路，并开启自动跳转 + 智能重试 */
+    private fun startEntryChain() {
+        disarmStartupFallback()
         entryMode = true
         entryFailCount = 0
         autoJumpIssued = false
-        DebugLog.log("ENTRY", "开始进入论坛（启动）")
-        loadUrl("https://www.soushu2030.com")
+        autoJumpAttempt = 0
+        lastAutoJumpPageUrl = null
+        lastAutoJumpTs = 0L
+        lastEntryProgressTs = System.currentTimeMillis()
+        entryChainStartTs = lastEntryProgressTs
+        DebugLog.log("ENTRY", "开始进入论坛（发布页链路）")
+        loadUrl(ENTRY_URL)
         armEntryWatchdog()
+    }
+
+    /**
+     * 已保存网址的冷启动兜底：一段时间内没加载出任何真实页面，
+     * 说明保存的论坛域名已作废，自动改走发布页链路重新获取最新域名。
+     */
+    private fun armStartupFallback() {
+        disarmStartupFallback()
+        val run = Runnable {
+            if (entryMode) return@Runnable
+            val idle = System.currentTimeMillis() - lastLoadedPageTs
+            if (lastLoadedPageTs > 0L && idle < ENTRY_STARTUP_FALLBACK_MS) return@Runnable
+            DebugLog.log("ENTRY", "保存的网址未能打开，回落发布页链路")
+            startEntryChain()
+        }
+        startupFallback = run
+        webView.postDelayed(run, ENTRY_STARTUP_FALLBACK_MS)
+    }
+
+    private fun disarmStartupFallback() {
+        startupFallback?.let { webView.removeCallbacks(it) }
+        startupFallback = null
     }
 
     /** 判定是否为可视为“内容页”的真实 http(s) 页面（排除 about:blank / data: / 空 url） */
@@ -829,10 +932,32 @@ class MainActivity : AppCompatActivity() {
         return low.startsWith("http://") || low.startsWith("https://")
     }
 
+    /**
+     * 切换 WebView 缓存策略。
+     *
+     *  - 入口链路（[forumMode] = false）：必须绕过缓存。
+     *    发布入口首页返回 403、发布导航页返回 200 但**都不带 Cache-Control / ETag / Last-Modified**，
+     *    这类响应在 LOAD_CACHE_ELSE_NETWORK（v2.7.0「浏览提速」引入）下会被当成「缓存可用」反复读旧页，
+     *    而旧页里的 sigin 跳转参数由服务端轮换 —— 卡在发布页、永远拿不到下一跳，
+     *    正是「进了 App 却跳不进论坛」最直接的一条路径。
+     *  - 论坛浏览（[forumMode] = true）：恢复 LOAD_CACHE_ELSE_NETWORK 提命中率（v2.7.0 的浏览提速）。
+     */
+    private fun applyCacheMode(forumMode: Boolean) {
+        try {
+            webView.settings.cacheMode =
+                if (forumMode) WebSettings.LOAD_CACHE_ELSE_NETWORK else WebSettings.LOAD_NO_CACHE
+        } catch (e: Exception) {
+            DebugLog.log("ENTRY", "切换缓存策略失败: ${e.message}")
+        }
+    }
+
     /** 退出启动重试窗口 */
     private fun endForumEntry(success: Boolean) {
         disarmEntryWatchdog()
+        disarmStartupFallback()
         if (!entryMode && success) return   // 已退出则忽略重复成功信号
+        // 入口链路用 LOAD_DEFAULT 拿新鲜响应，进论坛后再恢复「浏览提速」的缓存优先策略
+        applyCacheMode(forumMode = success)
         entryMode = false
         entryFailCount = 0
         DebugLog.log("ENTRY", if (success) "已进入论坛，退出启动重试" else "放弃启动重试")
@@ -865,11 +990,35 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** URL 是否仍属于“发布链路”域名（soushu2030 入口 / 发布导航页） */
+    /**
+     * URL 是否仍属于「发布链路」域名（soushu2030 入口 / 发布导航页）。
+     *
+     * 判定分两级，避免「已知论坛被路径片段误伤」：
+     *  1) 主机名命中 [entryHostMarkers] → 是发布链路；
+     *  2) 否则只有在**主机名不是任何已知论坛域名**时，才用 [entryPathMarkers]（book/、/o/）兜底识别
+     *     轮换出来的新发布页。已知论坛（含已保存网址、已进入过的域名）即使路径带 book/ 也不误判，
+     *     否则 onPageFinished 永远不结案、看门狗反复重启链路，表现为「进不去论坛」。
+     */
     private fun isEntryHostUrl(url: String?): Boolean {
         if (url.isNullOrBlank()) return false
         val low = url.lowercase()
-        return entryHostMarkers.any { low.contains(it) }
+        if (entryHostMarkers.any { low.contains(it) }) return true
+        if (!low.startsWith("http://") && !low.startsWith("https://")) return false
+        if (isKnownForumHost(url)) return false
+        return entryPathMarkers.any { low.contains(it) }
+    }
+
+    /** 主机名是否已被认定为论坛（保存的网址 / 内存登记 / 历史可信域名） */
+    private fun isKnownForumHost(url: String?): Boolean {
+        val h = hostOf(url) ?: return false
+        entryTrustedHost?.let { if (h == it || h.endsWith(".$it")) return true }
+        hostOf(Prefs.getUrl(this))?.let { if (h == it || h.endsWith(".$it")) return true }
+        return try { Prefs.getTrustedHosts(this).any { h == it || h.endsWith(".$it") } } catch (_: Exception) { false }
+    }
+
+    private fun hostOf(url: String?): String? {
+        if (url.isNullOrBlank()) return null
+        return try { Uri.parse(url).host?.lowercase()?.trim()?.takeIf { it.isNotBlank() } } catch (_: Exception) { null }
     }
 
     /**
@@ -947,12 +1096,17 @@ class MainActivity : AppCompatActivity() {
         DebugLog.log("ENTRY", "启动进入失败，第 $entryFailCount/$ENTRY_MAX_RETRY 次")
         if (entryFailCount < ENTRY_MAX_RETRY) {
             autoJumpIssued = false   // 即将从入口页重走整条链路，跳转标记复位
+            autoJumpAttempt = 0
+            lastAutoJumpPageUrl = null
+            lastAutoJumpTs = 0L
+            lastEntryProgressTs = System.currentTimeMillis()
+            entryChainStartTs = lastEntryProgressTs
             armEntryWatchdog()
             webView.postDelayed({
                 // 延迟期间若已成功进入(用户已开始浏览)则不再重试
                 if (entryMode) {
                     DebugLog.log("ENTRY", "自动重试进入…")
-                    loadUrl("https://www.soushu2030.com")
+                    loadUrl(ENTRY_URL)
                 }
             }, ENTRY_RETRY_DELAY_MS)
         } else {
@@ -967,16 +1121,46 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 进入看门狗：进入窗口内若一直没到达真实内容页（可能静默停在 about:blank），超时视为一次失败并重试 */
+    /**
+     * 入口看门狗（v2.6.1 改为「进展心跳」判定）。
+     *
+     * 原实现是一次性 6s 定时：到点没进论坛就判失败重走链路。问题是真实入口链路本身
+     * 就要经过 3 跳 meta-refresh，弱网/新域名 DNS 慢时 6s 根本不够，于是会：
+     * 判定失败 → 重载 hop1 → 又 6s → 再失败 → 3 次后弹「暂时无法访问」，
+     * 表现为「刚看到发布页就闪白，永远进不去论坛」。
+     *
+     * 现在改为：只要每次检查发现距上次页面加载完成（[lastEntryProgressTs]）不到一个间隔，
+     * 就认为链路仍在推进，重新续期；连续「无任何页面进展」超过预算才真正判失败。
+     */
     private fun armEntryWatchdog() {
         disarmEntryWatchdog()
+        scheduleEntryWatchdog(if (autoJumpIssued) ENTRY_WATCHDOG_AFTER_JUMP_MS else ENTRY_WATCHDOG_MS)
+    }
+
+    private fun scheduleEntryWatchdog(delayMs: Long) {
         val run = Runnable {
             if (!entryMode) return@Runnable
-            DebugLog.log("ENTRY", "进入看门狗超时：仍未进入论坛")
+            val now = System.currentTimeMillis()
+            val idle = now - lastEntryProgressTs
+            // 绝对上限：即使页面一直在动（站点把入口做成 redirect 循环），也不能无限续命。
+            val total = now - entryChainStartTs
+            if (total >= ENTRY_CHAIN_MAX_MS) {
+                DebugLog.log("ENTRY", "入口链路总时长 ${total}ms 超限，判定失败")
+                recordEntryFailure()
+                return@Runnable
+            }
+            if (idle < delayMs) {
+                // 距上一次页面进展还不满一个窗口：链路仍在推进（中间页跳转 / 新域名解析 / 发布页轮询中），
+                // 按同样的预算续期，直到「连续无任何进展」超过一个窗口才判失败。
+                DebugLog.log("ENTRY", "链路仍在推进(idle=${idle}ms,total=${total}ms)，看门狗续期")
+                scheduleEntryWatchdog(delayMs)
+                return@Runnable
+            }
+            DebugLog.log("ENTRY", "进入看门狗超时：${idle}ms 无任何页面进展")
             recordEntryFailure()
         }
         entryWatchdog = run
-        webView.postDelayed(run, if (autoJumpIssued) ENTRY_WATCHDOG_AFTER_JUMP_MS else ENTRY_WATCHDOG_MS)
+        webView.postDelayed(run, delayMs)
     }
 
     private fun disarmEntryWatchdog() {
